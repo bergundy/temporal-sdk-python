@@ -1,1 +1,4 @@
 temporalio/proto/*
+temporalio/bridge/target/
+dist
+sdist
