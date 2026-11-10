@@ -20,7 +20,12 @@ from temporalio import activity, workflow
 from temporalio.api.enums.v1 import EventType, WorkflowTaskFailedCause
 from temporalio.api.history.v1 import HistoryEvent
 from temporalio.api.workflowservice.v1 import DescribeNamespaceRequest
-from temporalio.client import Client, WorkflowHandle, WorkflowHistory
+from temporalio.client import (
+    Client,
+    WorkflowFailureError,
+    WorkflowHandle,
+    WorkflowHistory,
+)
 from temporalio.common import RetryPolicy
 from temporalio.converter import PayloadConverter
 from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
@@ -290,14 +295,16 @@ async def test_speculative_activity_failure_retried_by_server(client: Client):
             "WORKFLOW_EXECUTION_COMPLETED",
         ],
     )
-    started = next(
-        e for e in events if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED
-    )
-    assert started.activity_task_started_event_attributes.attempt == 2
-    assert (
-        started.activity_task_started_event_attributes.last_failure.message
-        == "Intentional failure"
-    )
+    if supported:
+        # The optimistic attempt's failure went through the normal RPC
+        started = next(
+            e
+            for e in events
+            if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED
+        )
+        attrs = started.activity_task_started_event_attributes
+        assert attrs.attempt == 2
+        assert attrs.last_failure.message == "Intentional failure"
     await _replay(handle, FailureRetriedWorkflow)
 
 
@@ -1070,6 +1077,9 @@ async def test_speculative_worker_shutdown_during_window(
         activities=[wait_for_test],
         task_queue=task_queue,
         graceful_shutdown_timeout=timedelta(seconds=10),
+        # Keeps the next workflow task off this worker's sticky queue, which
+        # not every server reroutes after shutdown
+        max_cached_workflows=0,
     )
     run_task = asyncio.create_task(worker.run())
     handle = await client.start_workflow(
@@ -1097,3 +1107,497 @@ async def test_speculative_worker_shutdown_during_window(
         assert await handle.result() == "activity"
     assert _executions[key] == [1]
     await _replay(handle, ShutdownDuringWindowWorkflow)
+
+
+@workflow.defn
+class UpdateDuringWindowWorkflow:
+    def __init__(self) -> None:
+        self.observed: list[str] = []
+
+    @workflow.run
+    async def run(self, key: str) -> list[str]:
+        async with workflow.speculative():
+            self.observed.append(
+                await workflow.execute_activity(
+                    wait_for_test, key, start_to_close_timeout=timedelta(seconds=10)
+                )
+            )
+        await workflow.wait_condition(lambda: "update" in self.observed)
+        return self.observed
+
+    @workflow.update
+    def update(self) -> list[str]:
+        self.observed.append("update")
+        return list(self.observed)
+
+
+async def test_speculative_update_delivered_after_checkpoint(client: Client):
+    supported = await _optimistic_start_supported(client)
+    key = str(uuid.uuid4())
+    async with new_worker(
+        client, UpdateDuringWindowWorkflow, activities=[wait_for_test]
+    ) as worker:
+        handle = await client.start_workflow(
+            UpdateDuringWindowWorkflow.run,
+            key,
+            id=f"wf-{key}",
+            task_queue=worker.task_queue,
+        )
+        await _event(f"{key}-started").wait()
+        update = asyncio.create_task(
+            handle.execute_update(UpdateDuringWindowWorkflow.update)
+        )
+        if not supported:
+            assert await update == ["update"]
+        else:
+            # Delivered only after the checkpoint, which waits for the activity
+            await asyncio.sleep(0.5)
+            assert not update.done()
+        _event(f"{key}-continue").set()
+        if supported:
+            assert await update == ["activity", "update"]
+        assert await handle.result() == (
+            ["activity", "update"] if supported else ["update", "activity"]
+        )
+    await _replay(handle, UpdateDuringWindowWorkflow)
+
+
+@workflow.defn
+class CancelledDuringWindowWorkflow:
+    @workflow.run
+    async def run(self, key: str) -> None:
+        async with workflow.speculative():
+            await workflow.execute_activity(
+                wait_for_test, key, start_to_close_timeout=timedelta(seconds=10)
+            )
+            await workflow.sleep(60)
+
+
+async def test_speculative_workflow_cancelled_during_window(client: Client):
+    supported = await _optimistic_start_supported(client)
+    key = str(uuid.uuid4())
+    async with new_worker(
+        client, CancelledDuringWindowWorkflow, activities=[wait_for_test]
+    ) as worker:
+        handle = await client.start_workflow(
+            CancelledDuringWindowWorkflow.run,
+            key,
+            id=f"wf-{key}",
+            task_queue=worker.task_queue,
+            task_timeout=timedelta(seconds=2),
+        )
+        await _event(f"{key}-started").wait()
+        await handle.cancel()
+        _event(f"{key}-continue").set()
+        with pytest.raises(WorkflowFailureError) as err:
+            await handle.result()
+        assert isinstance(err.value.cause, CancelledError)
+    summary = _summarize(await _history(handle))
+    assert summary[-1] == "WORKFLOW_EXECUTION_CANCELED"
+    if supported:
+        # The cancellation waited for the checkpoint, at the latest when the
+        # window's sleep was handed off
+        cancel_requested = summary.index("WORKFLOW_EXECUTION_CANCEL_REQUESTED")
+        assert summary[4:cancel_requested] == [
+            "ACTIVITY_TASK_SCHEDULED optimistic_start",
+            "ACTIVITY_TASK_STARTED optimistic_resolution",
+            "ACTIVITY_TASK_COMPLETED optimistic_resolution",
+            "TIMER_STARTED optimistic_start",
+        ]
+    await _replay(handle, CancelledDuringWindowWorkflow)
+
+
+@workflow.defn
+class ContinueAsNewInBlockWorkflow:
+    @workflow.run
+    async def run(self, iteration: int) -> int:
+        async with workflow.speculative():
+            await workflow.execute_activity(
+                sleep_and_return,
+                args=["x", 0],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+            if iteration < 2:
+                workflow.continue_as_new(iteration + 1)
+        return iteration
+
+
+async def test_speculative_continue_as_new(client: Client):
+    supported = await _optimistic_start_supported(client)
+    async with new_worker(
+        client, ContinueAsNewInBlockWorkflow, activities=[sleep_and_return]
+    ) as worker:
+        handle = await client.start_workflow(
+            ContinueAsNewInBlockWorkflow.run,
+            0,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        assert await handle.result() == 2
+    first_run = client.get_workflow_handle(
+        handle.id, run_id=handle.first_execution_run_id
+    )
+    await _assert_history(
+        first_run,
+        supported,
+        [
+            "WORKFLOW_EXECUTION_STARTED",
+            "WORKFLOW_TASK_SCHEDULED",
+            "WORKFLOW_TASK_STARTED",
+            "WORKFLOW_TASK_COMPLETED",
+            "ACTIVITY_TASK_SCHEDULED optimistic_start",
+            "ACTIVITY_TASK_STARTED optimistic_resolution",
+            "ACTIVITY_TASK_COMPLETED optimistic_resolution",
+            "WORKFLOW_EXECUTION_CONTINUED_AS_NEW",
+        ],
+    )
+    await _replay(first_run, ContinueAsNewInBlockWorkflow)
+    await _replay(handle, ContinueAsNewInBlockWorkflow)
+
+
+@workflow.defn
+class ChildWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        return "child"
+
+
+@workflow.defn
+class ChildInBlockWorkflow:
+    @workflow.run
+    async def run(self) -> list[str]:
+        async with workflow.speculative():
+            before = await workflow.execute_activity(
+                sleep_and_return,
+                args=["before", 0],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+            child = await workflow.execute_child_workflow(
+                ChildWorkflow.run, id=f"{workflow.info().workflow_id}-child"
+            )
+            after = await workflow.execute_activity(
+                sleep_and_return,
+                args=["after", 0],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+        return [before, child, after]
+
+
+async def test_speculative_child_workflow_in_block(client: Client):
+    supported = await _optimistic_start_supported(client)
+    async with new_worker(
+        client,
+        ChildInBlockWorkflow,
+        ChildWorkflow,
+        activities=[sleep_and_return],
+    ) as worker:
+        handle = await client.start_workflow(
+            ChildInBlockWorkflow.run,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        assert await handle.result() == ["before", "child", "after"]
+    events = await _history(handle)
+    summary = _summarize(events)
+    if supported:
+        # The child can't be deferred, so it checkpoints the window, and the
+        # block's next activity opens a new one
+        assert summary[4:8] == [
+            "ACTIVITY_TASK_SCHEDULED optimistic_start",
+            "ACTIVITY_TASK_STARTED optimistic_resolution",
+            "ACTIVITY_TASK_COMPLETED optimistic_resolution",
+            "START_CHILD_WORKFLOW_EXECUTION_INITIATED",
+        ]
+        assert summary.count("ACTIVITY_TASK_SCHEDULED optimistic_start") == 2
+    else:
+        assert not any(_optimistic_flags(e) for e in events)
+    await _replay(handle, ChildInBlockWorkflow, ChildWorkflow)
+
+
+@activity.defn
+async def large_result(size: int) -> str:
+    return "x" * size
+
+
+@workflow.defn
+class PayloadBudgetWorkflow:
+    @workflow.run
+    async def run(self) -> list[int]:
+        sizes = []
+        async with workflow.speculative():
+            for _ in range(3):
+                result = await workflow.execute_activity(
+                    large_result,
+                    1024 * 1024,
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
+                sizes.append(len(result))
+        return sizes
+
+
+async def test_speculative_payload_budget(client: Client):
+    supported = await _optimistic_start_supported(client)
+    async with new_worker(
+        client, PayloadBudgetWorkflow, activities=[large_result]
+    ) as worker:
+        handle = await client.start_workflow(
+            PayloadBudgetWorkflow.run,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        assert await handle.result() == [1024 * 1024] * 3
+    summary = _summarize(await _history(handle))
+    if supported:
+        # 3 MiB of results don't fit in one 2 MiB checkpoint
+        assert summary.count("WORKFLOW_TASK_COMPLETED") > 1
+        assert summary.count("ACTIVITY_TASK_SCHEDULED optimistic_start") == 3
+    await _replay(handle, PayloadBudgetWorkflow)
+
+
+@workflow.defn
+class OtherTaskQueueWorkflow:
+    @workflow.run
+    async def run(self, other_task_queue: str) -> list[str]:
+        def run_activity(name: str, task_queue: str | None = None):
+            return workflow.execute_activity(
+                sleep_and_return,
+                args=[name, 0],
+                task_queue=task_queue,
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+
+        async with workflow.speculative():
+            other = await run_activity("other queue", other_task_queue)
+            own = await run_activity("own queue")
+        return [other, own]
+
+
+async def test_speculative_other_task_queue_runs_normally(client: Client):
+    supported = await _optimistic_start_supported(client)
+    async with new_worker(
+        client, OtherTaskQueueWorkflow, activities=[sleep_and_return]
+    ) as worker:
+        async with new_worker(client, activities=[sleep_and_return]) as other:
+            handle = await client.start_workflow(
+                OtherTaskQueueWorkflow.run,
+                other.task_queue,
+                id=f"wf-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+            assert await handle.result() == ["other queue", "own queue"]
+    flags = [
+        _optimistic_flags(e)
+        for e in await _history(handle)
+        if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+    ]
+    assert flags == [[], ["optimistic_start"] if supported else []]
+    await _replay(handle, OtherTaskQueueWorkflow)
+
+
+async def test_speculative_without_free_activity_slots(client: Client):
+    supported = await _optimistic_start_supported(client)
+    async with new_worker(
+        client,
+        ExampleWorkflow,
+        activities=[sleep_and_return],
+        # The poller holds the only slot, as with eager activities
+        max_concurrent_activities=1,
+    ) as worker:
+        handle = await client.start_workflow(
+            ExampleWorkflow.run,
+            0.1,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        # With one slot the activities run one after the other, in whatever
+        # order they're dispatched
+        result = await handle.result()
+        assert sorted(result[:2]) == ["a1", "a2"] and result[2] == "a3"
+    events = await _history(handle)
+    assert not any(
+        _optimistic_flags(e)
+        for e in events
+        if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+    )
+    # The timer doesn't need a slot
+    assert supported == any(
+        _optimistic_flags(e)
+        for e in events
+        if e.event_type == EventType.EVENT_TYPE_TIMER_STARTED
+    )
+    await _replay(handle, ExampleWorkflow)
+
+
+@activity.defn
+async def slow_first_attempt() -> int:
+    if activity.info().attempt == 1:
+        await asyncio.sleep(3)
+    return activity.info().attempt
+
+
+@workflow.defn
+class StartToCloseTimeoutWorkflow:
+    @workflow.run
+    async def run(self) -> int:
+        async with workflow.speculative():
+            return await workflow.execute_activity(
+                slow_first_attempt,
+                start_to_close_timeout=timedelta(seconds=0.5),
+                retry_policy=RetryPolicy(initial_interval=timedelta(milliseconds=50)),
+            )
+
+
+async def test_speculative_activity_start_to_close_timeout(client: Client):
+    supported = await _optimistic_start_supported(client)
+    async with new_worker(
+        client, StartToCloseTimeoutWorkflow, activities=[slow_first_attempt]
+    ) as worker:
+        handle = await client.start_workflow(
+            StartToCloseTimeoutWorkflow.run,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        assert await handle.result() == 2
+    events = await _history(handle)
+    if supported:
+        assert "optimistic_start" in _optimistic_flags(
+            next(
+                e
+                for e in events
+                if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+            )
+        )
+        # Timeouts stay server-generated, also for an optimistic attempt
+        started = next(
+            e
+            for e in events
+            if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED
+        )
+        assert started.activity_task_started_event_attributes.last_failure.HasField(
+            "timeout_failure_info"
+        )
+    await _replay(handle, StartToCloseTimeoutWorkflow)
+
+
+async def test_speculative_example_without_cache(client: Client):
+    supported = await _optimistic_start_supported(client)
+    async with new_worker(
+        client,
+        ExampleWorkflow,
+        activities=[sleep_and_return],
+        max_cached_workflows=0,
+    ) as worker:
+        handle = await client.start_workflow(
+            ExampleWorkflow.run,
+            0.1,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        # The workflow is replayed from history before each task
+        assert await handle.result() == ["a2", "a1", "a3"]
+    events = await _history(handle)
+    assert supported == any(_optimistic_flags(e) for e in events)
+    await _replay(handle, ExampleWorkflow)
+
+
+@workflow.defn
+class PatchedAndUpsertWorkflow:
+    @workflow.run
+    async def run(self) -> list[str]:
+        async with workflow.speculative():
+            first = await workflow.execute_activity(
+                sleep_and_return,
+                args=["first", 0],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+            patched = workflow.patched("in-window")
+            workflow.upsert_memo({"memo": "set in window"})
+            second = await workflow.execute_activity(
+                sleep_and_return,
+                args=["second", 0],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+        return [first, str(patched), second]
+
+
+async def test_speculative_patched_and_upsert_in_window(client: Client):
+    supported = await _optimistic_start_supported(client)
+    async with new_worker(
+        client, PatchedAndUpsertWorkflow, activities=[sleep_and_return]
+    ) as worker:
+        handle = await client.start_workflow(
+            PatchedAndUpsertWorkflow.run,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        assert await handle.result() == ["first", "True", "second"]
+    summary = _summarize(await _history(handle))
+    if supported:
+        # Markers and workflow property changes don't end the window
+        assert summary.count("WORKFLOW_TASK_COMPLETED") == 1
+    assert await (await handle.describe()).memo_value("memo") == "set in window"
+    await _replay(handle, PatchedAndUpsertWorkflow)
+
+
+@activity.defn
+async def report_timeouts() -> list[float | None]:
+    info = activity.info()
+    return [
+        t.total_seconds() if t is not None else None
+        for t in [
+            info.schedule_to_close_timeout,
+            info.start_to_close_timeout,
+            info.heartbeat_timeout,
+        ]
+    ]
+
+
+@workflow.defn
+class ActivityTimeoutsWorkflow:
+    @workflow.run
+    async def run(self) -> list[list[float | None]]:
+        results = []
+        for heartbeat_timeout in [None, timedelta(seconds=20)]:
+            normal = await workflow.execute_activity(
+                report_timeouts,
+                start_to_close_timeout=timedelta(seconds=10),
+                heartbeat_timeout=heartbeat_timeout,
+            )
+            async with workflow.speculative():
+                optimistic = await workflow.execute_activity(
+                    report_timeouts,
+                    start_to_close_timeout=timedelta(seconds=10),
+                    heartbeat_timeout=heartbeat_timeout,
+                )
+            results += [normal, optimistic]
+        return results
+
+
+async def test_speculative_activity_info_timeouts(client: Client):
+    supported = await _optimistic_start_supported(client)
+    async with new_worker(
+        client, ActivityTimeoutsWorkflow, activities=[report_timeouts]
+    ) as worker:
+        handle = await client.start_workflow(
+            ActivityTimeoutsWorkflow.run,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+            run_timeout=timedelta(seconds=60),
+        )
+        results = await handle.result()
+    normal, optimistic, normal_heartbeat, optimistic_heartbeat = results
+    # Optimistic tasks get the timeouts the server fills in on the tasks it
+    # dispatches, ex: schedule-to-close from the run timeout
+    assert optimistic == normal == [60.0, 10.0, None]
+    assert optimistic_heartbeat == normal_heartbeat
+    if supported:
+        # The server caps the heartbeat timeout at start-to-close
+        assert optimistic_heartbeat == [60.0, 10.0, 10.0]
+    flags = [
+        _optimistic_flags(e)
+        for e in await _history(handle)
+        if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+    ]
+    expected = ["optimistic_start"] if supported else []
+    assert flags == [[], expected, [], expected]
+    await _replay(handle, ActivityTimeoutsWorkflow)
