@@ -1920,6 +1920,11 @@ async def test_workflow_cancel_child_started(client: Client, use_execute: bool):
         await assert_workflow_exists_eventually(
             client, LongSleepWorkflow.run, f"{handle.id}_child"
         )
+        # The signal handler needs the child's task, which the workflow only has
+        # once it saw the child start
+        await assert_eq_eventually(
+            True, lambda: handle.query(CancelChildWorkflow.ready)
+        )
         # Send cancel signal and wait on the handle
         await handle.signal(CancelChildWorkflow.cancel_child)
         with pytest.raises(WorkflowFailureError) as err:
