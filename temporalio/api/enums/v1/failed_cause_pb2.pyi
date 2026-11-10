@@ -188,6 +188,18 @@ class _WorkflowTaskFailedCauseEnumTypeWrapper(
         _WorkflowTaskFailedCause.ValueType
     )  # 40
     """A workflow task failed because the request exceeded a size limit."""
+    WORKFLOW_TASK_FAILED_CAUSE_BAD_RESOLVE_OPTIMISTIC_ACTIVITY_ATTRIBUTES: (
+        _WorkflowTaskFailedCause.ValueType
+    )  # 41
+    """A workflow task failed because a `ResolveOptimisticActivity` command was invalid, for example
+    because it didn't reference an activity started optimistically earlier in the same task.
+    """
+    WORKFLOW_TASK_FAILED_CAUSE_BAD_FIRE_OPTIMISTIC_TIMER_ATTRIBUTES: (
+        _WorkflowTaskFailedCause.ValueType
+    )  # 42
+    """A workflow task failed because a `FireOptimisticTimer` command was invalid, for example
+    because it didn't reference a timer started optimistically earlier in the same task.
+    """
 
 class WorkflowTaskFailedCause(
     _WorkflowTaskFailedCause, metaclass=_WorkflowTaskFailedCauseEnumTypeWrapper
@@ -346,6 +358,18 @@ WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED: (
 """A workflow task is failed because the workflow is paused before the task is started."""
 WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE: WorkflowTaskFailedCause.ValueType  # 40
 """A workflow task failed because the request exceeded a size limit."""
+WORKFLOW_TASK_FAILED_CAUSE_BAD_RESOLVE_OPTIMISTIC_ACTIVITY_ATTRIBUTES: (
+    WorkflowTaskFailedCause.ValueType
+)  # 41
+"""A workflow task failed because a `ResolveOptimisticActivity` command was invalid, for example
+because it didn't reference an activity started optimistically earlier in the same task.
+"""
+WORKFLOW_TASK_FAILED_CAUSE_BAD_FIRE_OPTIMISTIC_TIMER_ATTRIBUTES: (
+    WorkflowTaskFailedCause.ValueType
+)  # 42
+"""A workflow task failed because a `FireOptimisticTimer` command was invalid, for example
+because it didn't reference a timer started optimistically earlier in the same task.
+"""
 global___WorkflowTaskFailedCause = WorkflowTaskFailedCause
 
 class _ActivityTaskFailedCause:

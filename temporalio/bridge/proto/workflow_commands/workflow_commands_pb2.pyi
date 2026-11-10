@@ -362,15 +362,23 @@ class StartTimer(google.protobuf.message.Message):
 
     SEQ_FIELD_NUMBER: builtins.int
     START_TO_FIRE_TIMEOUT_FIELD_NUMBER: builtins.int
+    SPECULATIVE_FIELD_NUMBER: builtins.int
     seq: builtins.int
     """Lang's incremental sequence number, used as the operation identifier"""
     @property
     def start_to_fire_timeout(self) -> google.protobuf.duration_pb2.Duration: ...
+    speculative: builtins.bool
+    """Set when the timer was started inside a speculative block. Core may then run the timer
+    locally inside a speculation window (optimistic start) instead of sending it to the server
+    right away. Whether it actually does is up to Core: workflow code must behave the same
+    either way, and replay is unaffected by the decision.
+    """
     def __init__(
         self,
         *,
         seq: builtins.int = ...,
         start_to_fire_timeout: google.protobuf.duration_pb2.Duration | None = ...,
+        speculative: builtins.bool = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -381,7 +389,12 @@ class StartTimer(google.protobuf.message.Message):
     def ClearField(
         self,
         field_name: typing_extensions.Literal[
-            "seq", b"seq", "start_to_fire_timeout", b"start_to_fire_timeout"
+            "seq",
+            b"seq",
+            "speculative",
+            b"speculative",
+            "start_to_fire_timeout",
+            b"start_to_fire_timeout",
         ],
     ) -> None: ...
 
@@ -444,6 +457,7 @@ class ScheduleActivity(google.protobuf.message.Message):
     DO_NOT_EAGERLY_EXECUTE_FIELD_NUMBER: builtins.int
     VERSIONING_INTENT_FIELD_NUMBER: builtins.int
     PRIORITY_FIELD_NUMBER: builtins.int
+    SPECULATIVE_FIELD_NUMBER: builtins.int
     seq: builtins.int
     """Lang's incremental sequence number, used as the operation identifier"""
     activity_id: builtins.str
@@ -503,6 +517,15 @@ class ScheduleActivity(google.protobuf.message.Message):
     @property
     def priority(self) -> temporalio.api.common.v1.message_pb2.Priority:
         """The Priority to use for this activity"""
+    speculative: builtins.bool
+    """Set when the activity was scheduled inside a speculative block. Core may then start the
+    activity on this worker inside a speculation window (optimistic start), before the server
+    knows about it, and deliver it through the normal activity task stream. Whether it actually
+    does is up to Core (task queue, free slots, server capability, ...): workflow code must
+    behave the same either way, and replay is unaffected by the decision. Lang must not set
+    this on local activities; scheduling a local activity inside a speculative block is an
+    error lang reports itself.
+    """
     def __init__(
         self,
         *,
@@ -527,6 +550,7 @@ class ScheduleActivity(google.protobuf.message.Message):
         do_not_eagerly_execute: builtins.bool = ...,
         versioning_intent: temporalio.bridge.proto.common.common_pb2.VersioningIntent.ValueType = ...,
         priority: temporalio.api.common.v1.message_pb2.Priority | None = ...,
+        speculative: builtins.bool = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -572,6 +596,8 @@ class ScheduleActivity(google.protobuf.message.Message):
             b"schedule_to_start_timeout",
             "seq",
             b"seq",
+            "speculative",
+            b"speculative",
             "start_to_close_timeout",
             b"start_to_close_timeout",
             "task_queue",

@@ -65,6 +65,7 @@ class NamespaceInfo(google.protobuf.message.Message):
         STANDALONE_ACTIVITY_START_DELAY_FIELD_NUMBER: builtins.int
         STANDALONE_ACTIVITY_BATCH_OPERATIONS_FIELD_NUMBER: builtins.int
         STANDALONE_ACTIVITY_OPERATOR_COMMANDS_FIELD_NUMBER: builtins.int
+        OPTIMISTIC_START_FIELD_NUMBER: builtins.int
         eager_workflow_start: builtins.bool
         """True if the namespace supports eager workflow start."""
         sync_update: builtins.bool
@@ -104,6 +105,11 @@ class NamespaceInfo(google.protobuf.message.Message):
         """True if the namespace supports batch operations for standalone activities."""
         standalone_activity_operator_commands: builtins.bool
         """True if the namespace supports standalone activity operator commands."""
+        optimistic_start: builtins.bool
+        """True if the namespace supports optimistically started activities and timers
+        (`ScheduleActivityTaskCommandAttributes.optimistic_start`,
+        `StartTimerCommandAttributes.optimistic_start` and the commands that resolve them).
+        """
         def __init__(
             self,
             *,
@@ -124,6 +130,7 @@ class NamespaceInfo(google.protobuf.message.Message):
             standalone_activity_start_delay: builtins.bool = ...,
             standalone_activity_batch_operations: builtins.bool = ...,
             standalone_activity_operator_commands: builtins.bool = ...,
+            optimistic_start: builtins.bool = ...,
         ) -> None: ...
         def ClearField(
             self,
@@ -132,6 +139,8 @@ class NamespaceInfo(google.protobuf.message.Message):
                 b"async_update",
                 "eager_workflow_start",
                 b"eager_workflow_start",
+                "optimistic_start",
+                b"optimistic_start",
                 "poller_autoscaling",
                 b"poller_autoscaling",
                 "poller_autoscaling_auto_enroll",

@@ -1274,6 +1274,63 @@ class WorkflowTaskFailedEventAttributes(google.protobuf.message.Message):
 
 global___WorkflowTaskFailedEventAttributes = WorkflowTaskFailedEventAttributes
 
+class OptimisticStartInfo(google.protobuf.message.Message):
+    """Set on `ACTIVITY_TASK_SCHEDULED` and `TIMER_STARTED` events for commands the worker started
+    optimistically, inside a speculation window, before the server knew about them.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    START_TIME_FIELD_NUMBER: builtins.int
+    @property
+    def start_time(self) -> google.protobuf.timestamp_pb2.Timestamp:
+        """When the worker started the command: the workflow task's started event time plus the
+        offset reported by the worker, capped at the time the server processed the command. Times
+        that count from the start of the command (activity scheduled and started times, timeouts,
+        timer expiry) use this value instead of the event time.
+        """
+    def __init__(
+        self,
+        *,
+        start_time: google.protobuf.timestamp_pb2.Timestamp | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing_extensions.Literal["start_time", b"start_time"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self, field_name: typing_extensions.Literal["start_time", b"start_time"]
+    ) -> None: ...
+
+global___OptimisticStartInfo = OptimisticStartInfo
+
+class OptimisticResolution(google.protobuf.message.Message):
+    """Set on resolution events written from `ResolveOptimisticActivity` and `FireOptimisticTimer`
+    commands. The workflow already observed these outcomes during the workflow task that recorded
+    them, so SDKs apply them within that workflow task when replaying, not after the next one.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    WORKFLOW_TIME_FIELD_NUMBER: builtins.int
+    @property
+    def workflow_time(self) -> google.protobuf.timestamp_pb2.Timestamp:
+        """The workflow task's started event time plus the offset reported by the worker. SDKs set
+        workflow time to this value when applying the event.
+        """
+    def __init__(
+        self,
+        *,
+        workflow_time: google.protobuf.timestamp_pb2.Timestamp | None = ...,
+    ) -> None: ...
+    def HasField(
+        self, field_name: typing_extensions.Literal["workflow_time", b"workflow_time"]
+    ) -> builtins.bool: ...
+    def ClearField(
+        self, field_name: typing_extensions.Literal["workflow_time", b"workflow_time"]
+    ) -> None: ...
+
+global___OptimisticResolution = OptimisticResolution
+
 class ActivityTaskScheduledEventAttributes(google.protobuf.message.Message):
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 
@@ -1290,6 +1347,7 @@ class ActivityTaskScheduledEventAttributes(google.protobuf.message.Message):
     RETRY_POLICY_FIELD_NUMBER: builtins.int
     USE_WORKFLOW_BUILD_ID_FIELD_NUMBER: builtins.int
     PRIORITY_FIELD_NUMBER: builtins.int
+    OPTIMISTIC_START_FIELD_NUMBER: builtins.int
     activity_id: builtins.str
     """The worker/user assigned identifier for the activity"""
     @property
@@ -1348,6 +1406,11 @@ class ActivityTaskScheduledEventAttributes(google.protobuf.message.Message):
         """Priority metadata. If this message is not present, or any fields are not
         present, they inherit the values from the workflow.
         """
+    @property
+    def optimistic_start(self) -> global___OptimisticStartInfo:
+        """Set if the worker started this activity optimistically, inside a speculation window,
+        before the server knew about it.
+        """
     def __init__(
         self,
         *,
@@ -1364,6 +1427,7 @@ class ActivityTaskScheduledEventAttributes(google.protobuf.message.Message):
         retry_policy: temporalio.api.common.v1.message_pb2.RetryPolicy | None = ...,
         use_workflow_build_id: builtins.bool = ...,
         priority: temporalio.api.common.v1.message_pb2.Priority | None = ...,
+        optimistic_start: global___OptimisticStartInfo | None = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -1376,6 +1440,8 @@ class ActivityTaskScheduledEventAttributes(google.protobuf.message.Message):
             b"heartbeat_timeout",
             "input",
             b"input",
+            "optimistic_start",
+            b"optimistic_start",
             "priority",
             b"priority",
             "retry_policy",
@@ -1403,6 +1469,8 @@ class ActivityTaskScheduledEventAttributes(google.protobuf.message.Message):
             b"heartbeat_timeout",
             "input",
             b"input",
+            "optimistic_start",
+            b"optimistic_start",
             "priority",
             b"priority",
             "retry_policy",
@@ -1434,6 +1502,7 @@ class ActivityTaskStartedEventAttributes(google.protobuf.message.Message):
     LAST_FAILURE_FIELD_NUMBER: builtins.int
     WORKER_VERSION_FIELD_NUMBER: builtins.int
     BUILD_ID_REDIRECT_COUNTER_FIELD_NUMBER: builtins.int
+    OPTIMISTIC_RESOLUTION_FIELD_NUMBER: builtins.int
     scheduled_event_id: builtins.int
     """The id of the `ACTIVITY_TASK_SCHEDULED` event this task corresponds to"""
     identity: builtins.str
@@ -1463,6 +1532,11 @@ class ActivityTaskStartedEventAttributes(google.protobuf.message.Message):
     when rebuilding it from events.
     Deprecated. This field should be cleaned up when versioning-2 API is removed. [cleanup-experimental-wv]
     """
+    optimistic_resolution: builtins.bool
+    """True if this event was written together with an optimistic resolution, from a
+    `ResolveOptimisticActivity` command. SDKs use this to classify the event as produced by the
+    worker, without looking at the following event.
+    """
     def __init__(
         self,
         *,
@@ -1474,6 +1548,7 @@ class ActivityTaskStartedEventAttributes(google.protobuf.message.Message):
         worker_version: temporalio.api.common.v1.message_pb2.WorkerVersionStamp
         | None = ...,
         build_id_redirect_counter: builtins.int = ...,
+        optimistic_resolution: builtins.bool = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -1492,6 +1567,8 @@ class ActivityTaskStartedEventAttributes(google.protobuf.message.Message):
             b"identity",
             "last_failure",
             b"last_failure",
+            "optimistic_resolution",
+            b"optimistic_resolution",
             "request_id",
             b"request_id",
             "scheduled_event_id",
@@ -1511,6 +1588,7 @@ class ActivityTaskCompletedEventAttributes(google.protobuf.message.Message):
     STARTED_EVENT_ID_FIELD_NUMBER: builtins.int
     IDENTITY_FIELD_NUMBER: builtins.int
     WORKER_VERSION_FIELD_NUMBER: builtins.int
+    OPTIMISTIC_RESOLUTION_FIELD_NUMBER: builtins.int
     @property
     def result(self) -> temporalio.api.common.v1.message_pb2.Payloads:
         """Serialized results of the activity. IE: The return value of the activity function"""
@@ -1525,6 +1603,11 @@ class ActivityTaskCompletedEventAttributes(google.protobuf.message.Message):
         """Version info of the worker who processed this workflow task.
         Deprecated. This field should be cleaned up when versioning-2 API is removed. [cleanup-experimental-wv]
         """
+    @property
+    def optimistic_resolution(self) -> global___OptimisticResolution:
+        """Set if the workflow already observed this outcome during the workflow task that recorded
+        it (written from a `ResolveOptimisticActivity` command).
+        """
     def __init__(
         self,
         *,
@@ -1534,11 +1617,17 @@ class ActivityTaskCompletedEventAttributes(google.protobuf.message.Message):
         identity: builtins.str = ...,
         worker_version: temporalio.api.common.v1.message_pb2.WorkerVersionStamp
         | None = ...,
+        optimistic_resolution: global___OptimisticResolution | None = ...,
     ) -> None: ...
     def HasField(
         self,
         field_name: typing_extensions.Literal[
-            "result", b"result", "worker_version", b"worker_version"
+            "optimistic_resolution",
+            b"optimistic_resolution",
+            "result",
+            b"result",
+            "worker_version",
+            b"worker_version",
         ],
     ) -> builtins.bool: ...
     def ClearField(
@@ -1546,6 +1635,8 @@ class ActivityTaskCompletedEventAttributes(google.protobuf.message.Message):
         field_name: typing_extensions.Literal[
             "identity",
             b"identity",
+            "optimistic_resolution",
+            b"optimistic_resolution",
             "result",
             b"result",
             "scheduled_event_id",
@@ -1708,6 +1799,7 @@ class ActivityTaskCanceledEventAttributes(google.protobuf.message.Message):
     STARTED_EVENT_ID_FIELD_NUMBER: builtins.int
     IDENTITY_FIELD_NUMBER: builtins.int
     WORKER_VERSION_FIELD_NUMBER: builtins.int
+    OPTIMISTIC_RESOLUTION_FIELD_NUMBER: builtins.int
     @property
     def details(self) -> temporalio.api.common.v1.message_pb2.Payloads:
         """Additional information that the activity reported upon confirming cancellation"""
@@ -1726,6 +1818,11 @@ class ActivityTaskCanceledEventAttributes(google.protobuf.message.Message):
         """Version info of the worker who processed this workflow task.
         Deprecated. This field should be cleaned up when versioning-2 API is removed. [cleanup-experimental-wv]
         """
+    @property
+    def optimistic_resolution(self) -> global___OptimisticResolution:
+        """Set if the workflow already observed this outcome during the workflow task that recorded
+        it (written from a `ResolveOptimisticActivity` command).
+        """
     def __init__(
         self,
         *,
@@ -1736,11 +1833,17 @@ class ActivityTaskCanceledEventAttributes(google.protobuf.message.Message):
         identity: builtins.str = ...,
         worker_version: temporalio.api.common.v1.message_pb2.WorkerVersionStamp
         | None = ...,
+        optimistic_resolution: global___OptimisticResolution | None = ...,
     ) -> None: ...
     def HasField(
         self,
         field_name: typing_extensions.Literal[
-            "details", b"details", "worker_version", b"worker_version"
+            "details",
+            b"details",
+            "optimistic_resolution",
+            b"optimistic_resolution",
+            "worker_version",
+            b"worker_version",
         ],
     ) -> builtins.bool: ...
     def ClearField(
@@ -1752,6 +1855,8 @@ class ActivityTaskCanceledEventAttributes(google.protobuf.message.Message):
             b"identity",
             "latest_cancel_requested_event_id",
             b"latest_cancel_requested_event_id",
+            "optimistic_resolution",
+            b"optimistic_resolution",
             "scheduled_event_id",
             b"scheduled_event_id",
             "started_event_id",
@@ -1769,6 +1874,7 @@ class TimerStartedEventAttributes(google.protobuf.message.Message):
     TIMER_ID_FIELD_NUMBER: builtins.int
     START_TO_FIRE_TIMEOUT_FIELD_NUMBER: builtins.int
     WORKFLOW_TASK_COMPLETED_EVENT_ID_FIELD_NUMBER: builtins.int
+    OPTIMISTIC_START_FIELD_NUMBER: builtins.int
     timer_id: builtins.str
     """The worker/user assigned id for this timer"""
     @property
@@ -1780,22 +1886,34 @@ class TimerStartedEventAttributes(google.protobuf.message.Message):
         """
     workflow_task_completed_event_id: builtins.int
     """The `WORKFLOW_TASK_COMPLETED` event which this command was reported with"""
+    @property
+    def optimistic_start(self) -> global___OptimisticStartInfo:
+        """Set if the worker started this timer optimistically, inside a speculation window, before
+        the server knew about it. The timer expires at `optimistic_start.start_time` plus
+        `start_to_fire_timeout`.
+        """
     def __init__(
         self,
         *,
         timer_id: builtins.str = ...,
         start_to_fire_timeout: google.protobuf.duration_pb2.Duration | None = ...,
         workflow_task_completed_event_id: builtins.int = ...,
+        optimistic_start: global___OptimisticStartInfo | None = ...,
     ) -> None: ...
     def HasField(
         self,
         field_name: typing_extensions.Literal[
-            "start_to_fire_timeout", b"start_to_fire_timeout"
+            "optimistic_start",
+            b"optimistic_start",
+            "start_to_fire_timeout",
+            b"start_to_fire_timeout",
         ],
     ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing_extensions.Literal[
+            "optimistic_start",
+            b"optimistic_start",
             "start_to_fire_timeout",
             b"start_to_fire_timeout",
             "timer_id",
@@ -1812,20 +1930,38 @@ class TimerFiredEventAttributes(google.protobuf.message.Message):
 
     TIMER_ID_FIELD_NUMBER: builtins.int
     STARTED_EVENT_ID_FIELD_NUMBER: builtins.int
+    OPTIMISTIC_RESOLUTION_FIELD_NUMBER: builtins.int
     timer_id: builtins.str
     """Will match the `timer_id` from `TIMER_STARTED` event for this timer"""
     started_event_id: builtins.int
     """The id of the `TIMER_STARTED` event itself"""
+    @property
+    def optimistic_resolution(self) -> global___OptimisticResolution:
+        """Set if the workflow already observed this timer firing during the workflow task that
+        recorded it (written from a `FireOptimisticTimer` command).
+        """
     def __init__(
         self,
         *,
         timer_id: builtins.str = ...,
         started_event_id: builtins.int = ...,
+        optimistic_resolution: global___OptimisticResolution | None = ...,
     ) -> None: ...
+    def HasField(
+        self,
+        field_name: typing_extensions.Literal[
+            "optimistic_resolution", b"optimistic_resolution"
+        ],
+    ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing_extensions.Literal[
-            "started_event_id", b"started_event_id", "timer_id", b"timer_id"
+            "optimistic_resolution",
+            b"optimistic_resolution",
+            "started_event_id",
+            b"started_event_id",
+            "timer_id",
+            b"timer_id",
         ],
     ) -> None: ...
 

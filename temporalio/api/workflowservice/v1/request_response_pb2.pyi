@@ -1829,6 +1829,7 @@ class RespondWorkflowTaskCompletedResponse(google.protobuf.message.Message):
     WORKFLOW_TASK_FIELD_NUMBER: builtins.int
     ACTIVITY_TASKS_FIELD_NUMBER: builtins.int
     RESET_HISTORY_EVENT_ID_FIELD_NUMBER: builtins.int
+    OPTIMISTIC_ACTIVITY_TASKS_FIELD_NUMBER: builtins.int
     @property
     def workflow_task(self) -> global___PollWorkflowTaskQueueResponse:
         """See `RespondWorkflowTaskCompletedResponse::return_new_workflow_task`"""
@@ -1844,6 +1845,17 @@ class RespondWorkflowTaskCompletedResponse(google.protobuf.message.Message):
     Will be the event ID of the last workflow task started event in the history before the new workflow task.
     Server is only expected to discard a workflow task if it could not have modified the workflow state.
     """
+    @property
+    def optimistic_activity_tasks(
+        self,
+    ) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[
+        global___PollActivityTaskQueueResponse
+    ]:
+        """Activities started optimistically in this task that are still running and are now owned by
+        the server, like eager activities. The worker keeps executing them and uses these task
+        tokens for heartbeats and completion. Kept separate from `activity_tasks` so they can't be
+        mistaken for new tasks to start.
+        """
     def __init__(
         self,
         *,
@@ -1851,6 +1863,10 @@ class RespondWorkflowTaskCompletedResponse(google.protobuf.message.Message):
         activity_tasks: collections.abc.Iterable[global___PollActivityTaskQueueResponse]
         | None = ...,
         reset_history_event_id: builtins.int = ...,
+        optimistic_activity_tasks: collections.abc.Iterable[
+            global___PollActivityTaskQueueResponse
+        ]
+        | None = ...,
     ) -> None: ...
     def HasField(
         self, field_name: typing_extensions.Literal["workflow_task", b"workflow_task"]
@@ -1860,6 +1876,8 @@ class RespondWorkflowTaskCompletedResponse(google.protobuf.message.Message):
         field_name: typing_extensions.Literal[
             "activity_tasks",
             b"activity_tasks",
+            "optimistic_activity_tasks",
+            b"optimistic_activity_tasks",
             "reset_history_event_id",
             b"reset_history_event_id",
             "workflow_task",

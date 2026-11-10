@@ -111,6 +111,8 @@ class Success(google.protobuf.message.Message):
     COMMANDS_FIELD_NUMBER: builtins.int
     USED_INTERNAL_FLAGS_FIELD_NUMBER: builtins.int
     VERSIONING_BEHAVIOR_FIELD_NUMBER: builtins.int
+    SPECULATIVE_BLOCK_EXITED_FIELD_NUMBER: builtins.int
+    SPECULATIVE_BLOCK_ACTIVE_FIELD_NUMBER: builtins.int
     @property
     def commands(
         self,
@@ -127,6 +129,15 @@ class Success(google.protobuf.message.Message):
         temporalio.api.enums.v1.workflow_pb2.VersioningBehavior.ValueType
     )
     """The versioning behavior this workflow is currently using"""
+    speculative_block_exited: builtins.bool
+    """True if a speculative block exited during this activation. Core then ends the current
+    speculation window at the end of the activation unless `speculative_block_active` is set and
+    no non-speculative work (normal activities, timers, child workflows, Nexus operations) is
+    pending. A loop of sequential blocks that exits one block and enters the next in the same
+    activation therefore keeps a single window going.
+    """
+    speculative_block_active: builtins.bool
+    """True if at least one speculative block is still active at the end of this activation."""
     def __init__(
         self,
         *,
@@ -136,12 +147,18 @@ class Success(google.protobuf.message.Message):
         | None = ...,
         used_internal_flags: collections.abc.Iterable[builtins.int] | None = ...,
         versioning_behavior: temporalio.api.enums.v1.workflow_pb2.VersioningBehavior.ValueType = ...,
+        speculative_block_exited: builtins.bool = ...,
+        speculative_block_active: builtins.bool = ...,
     ) -> None: ...
     def ClearField(
         self,
         field_name: typing_extensions.Literal[
             "commands",
             b"commands",
+            "speculative_block_active",
+            b"speculative_block_active",
+            "speculative_block_exited",
+            b"speculative_block_exited",
             "used_internal_flags",
             b"used_internal_flags",
             "versioning_behavior",
