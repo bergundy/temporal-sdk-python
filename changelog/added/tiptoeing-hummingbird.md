@@ -1,0 +1,1 @@
+Add experimental `workflow.speculative()`, an async context manager in which activities on the workflow's task queue and timers may start right away on the worker, before the server knows about them, when the namespace supports optimistic start. History still records ordinary activity and timer events.

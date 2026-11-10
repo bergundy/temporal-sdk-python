@@ -151,6 +151,7 @@ from ._sandbox import (
     logger,
     unsafe,
 )
+from ._speculative import speculative
 from ._workflow_ops import (
     ChildWorkflowCancellationType,
     ChildWorkflowConfig,
@@ -258,6 +259,7 @@ __all__ = [
     "SandboxImportNotificationPolicy",
     "logger",
     "unsafe",
+    "speculative",
     "ChildWorkflowCancellationType",
     "ChildWorkflowConfig",
     "ChildWorkflowHandle",

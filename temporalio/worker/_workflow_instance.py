@@ -72,6 +72,7 @@ from ..workflow._event_groups import (
     _inbound_event_group,
     _inbound_update_event_group,
 )
+from ..workflow._speculative import _in_speculative_scope
 from . import _command_aware_visitor
 from ._interceptor import (
     ContinueAsNewInput,
@@ -337,6 +338,8 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
         self._seed_callbacks: list[Callable[[int], None]] = []
         self._read_only = False
         self._in_query_or_validator = False
+        # Speculative blocks entered and not yet exited, across all tasks
+        self._speculative_blocks_active = 0
 
         # Patches we have been notified of and memoized patch responses
         self._patches_notified: set[str] = set()
@@ -554,6 +557,8 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             self._current_completion.successful.versioning_behavior = (
                 self._versioning_behavior.value
             )
+        if self._speculative_blocks_active:
+            self._current_completion.successful.speculative_block_active = True
 
         # If we're deleting, there better be no more tasks. It is important for
         # the integrity of the system that we check this. If there are tasks
@@ -1294,6 +1299,14 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
 
     def workflow_cancellation_reason(self) -> str | None:
         return self._cancel_reason
+
+    def workflow_enter_speculative_block(self) -> None:
+        self._assert_not_read_only("enter speculative block")
+        self._speculative_blocks_active += 1
+
+    def workflow_exit_speculative_block(self) -> None:
+        self._speculative_blocks_active -= 1
+        self._current_completion.successful.speculative_block_exited = True
 
     def workflow_extern_functions(self) -> Mapping[str, Callable]:
         return self._extern_functions
@@ -2086,6 +2099,15 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             raise ValueError(
                 "Activity must have start_to_close_timeout or schedule_to_close_timeout"
             )
+        if isinstance(input, StartLocalActivityInput) and _in_speculative_scope():
+            # Fail the task even if workflow code catches this, since a local
+            # activity and a speculation window can't share a workflow task.
+            self._current_activation_error = RuntimeError(
+                f"Local activity {input.activity} cannot be scheduled inside a "
+                "speculative block. Use a normal activity, which may start "
+                "optimistically, or schedule it outside the block."
+            )
+            raise self._current_activation_error
 
         handle: _ActivityHandle
 
@@ -3039,6 +3061,7 @@ class _WorkflowInstanceImpl(  # type: ignore[reportImplicitAbstractClass]
             seq,
             self.time() + delay,
             options,
+            _in_speculative_scope(),
             callback,
             args,
             self,
@@ -3349,6 +3372,7 @@ class _TimerHandle(asyncio.TimerHandle):
         seq: int,
         when: float,
         options: _TimerOptions,
+        speculative: bool,
         callback: Callable[..., Any],
         args: Sequence[Any],
         loop: asyncio.AbstractEventLoop,
@@ -3357,6 +3381,7 @@ class _TimerHandle(asyncio.TimerHandle):
         super().__init__(when, callback, args, loop, context)
         self._seq = seq
         self._options = options
+        self._speculative = speculative
 
     def _apply_start_command(
         self,
@@ -3368,6 +3393,7 @@ class _TimerHandle(asyncio.TimerHandle):
             command.user_metadata.CopyFrom(self._options.user_metadata)
         command.event_group_markers.extend(self._options.event_group_markers or ())
         command.start_timer.start_to_fire_timeout.FromNanoseconds(int(delay * 1e9))
+        command.start_timer.speculative = self._speculative
 
     def _apply_cancel_command(
         self,
@@ -3416,6 +3442,9 @@ class _ActivityHandle(temporalio.workflow.ActivityHandle[Any]):
             )
         )
         self._event_group_markers = _capture_event_group_markers(input.event_groups)
+        self._speculative = (
+            isinstance(input, StartActivityInput) and _in_speculative_scope()
+        )
 
     def cancel(self, msg: Any | None = None) -> bool:
         # Allow the cancel to go through for the task even if we're deleting,
@@ -3523,6 +3552,7 @@ class _ActivityHandle(temporalio.workflow.ActivityHandle[Any]):
             command.schedule_activity.do_not_eagerly_execute = (
                 self._input.disable_eager_execution
             )
+            command.schedule_activity.speculative = self._speculative
             if self._input.versioning_intent:
                 command.schedule_activity.versioning_intent = (
                     self._input.versioning_intent._to_proto()
