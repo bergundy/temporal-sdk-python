@@ -1,0 +1,1 @@
+Add experimental secure credential propagation in `temporalio.contrib.credentials`: attach credentials such as a user's token to Client calls, forward them from Workflows with `propagate`, and read them in Activities and Nexus handlers with `get`, with Temporal Proxy sealing each one to its receiver and binding it to the call.
