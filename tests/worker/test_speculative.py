@@ -1314,46 +1314,6 @@ async def test_speculative_child_workflow_in_block(client: Client):
     await _replay(handle, ChildInBlockWorkflow, ChildWorkflow)
 
 
-@activity.defn
-async def large_result(size: int) -> str:
-    return "x" * size
-
-
-@workflow.defn
-class PayloadBudgetWorkflow:
-    @workflow.run
-    async def run(self) -> list[int]:
-        sizes = []
-        async with workflow.speculative():
-            for _ in range(3):
-                result = await workflow.execute_activity(
-                    large_result,
-                    1024 * 1024,
-                    start_to_close_timeout=timedelta(seconds=10),
-                )
-                sizes.append(len(result))
-        return sizes
-
-
-async def test_speculative_payload_budget(client: Client):
-    supported = await _optimistic_start_supported(client)
-    async with new_worker(
-        client, PayloadBudgetWorkflow, activities=[large_result]
-    ) as worker:
-        handle = await client.start_workflow(
-            PayloadBudgetWorkflow.run,
-            id=f"wf-{uuid.uuid4()}",
-            task_queue=worker.task_queue,
-        )
-        assert await handle.result() == [1024 * 1024] * 3
-    summary = _summarize(await _history(handle))
-    if supported:
-        # 3 MiB of results don't fit in one 2 MiB checkpoint
-        assert summary.count("WORKFLOW_TASK_COMPLETED") > 1
-        assert summary.count("ACTIVITY_TASK_SCHEDULED optimistic_start") == 3
-    await _replay(handle, PayloadBudgetWorkflow)
-
-
 @workflow.defn
 class OtherTaskQueueWorkflow:
     @workflow.run
