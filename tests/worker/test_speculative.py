@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from temporalio import activity, workflow
-from temporalio.api.enums.v1 import EventType, WorkflowTaskFailedCause
+from temporalio.api.enums.v1 import EventType, TimeoutType, WorkflowTaskFailedCause
 from temporalio.api.history.v1 import HistoryEvent
 from temporalio.api.workflowservice.v1 import DescribeNamespaceRequest
 from temporalio.client import (
@@ -29,6 +29,8 @@ from temporalio.client import (
 from temporalio.common import RetryPolicy
 from temporalio.converter import PayloadConverter
 from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
+from temporalio.runtime import MetricBuffer, Runtime, TelemetryConfig
+from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer
 from tests.helpers import (
     assert_eq_eventually,
@@ -1561,3 +1563,468 @@ async def test_speculative_activity_info_timeouts(client: Client):
     expected = ["optimistic_start"] if supported else []
     assert flags == [[], expected, [], expected]
     await _replay(handle, ActivityTimeoutsWorkflow)
+
+
+def _activity_ids_scheduled(events: list[HistoryEvent]) -> list[str]:
+    return [
+        e.activity_task_scheduled_event_attributes.activity_id
+        for e in events
+        if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+    ]
+
+
+@workflow.defn
+class ScheduleAndCancelWorkflow:
+    @workflow.run
+    async def run(
+        self,
+        cancellation_type: workflow.ActivityCancellationType,
+        cancel_after_start: bool,
+    ) -> list[str]:
+        def start(name: str, seconds: float, **kwargs):  # type: ignore[reportMissingParameterType]
+            return workflow.start_activity(
+                sleep_and_return,
+                args=[name, seconds],
+                start_to_close_timeout=timedelta(seconds=30),
+                **kwargs,
+            )
+
+        results = []
+        async with workflow.speculative():
+            results.append(await start("before", 0))
+            await workflow.sleep(0.05)
+            concurrent = start("concurrent", 0.05)
+            cancelled = start("cancelled", 10, cancellation_type=cancellation_type)
+            if cancel_after_start:
+                # Lets the handle's task start waiting on its result
+                await asyncio.sleep(0)
+            cancelled.cancel()
+            timer = asyncio.create_task(workflow.sleep(0.05))
+            try:
+                results.append(await cancelled)
+            except ActivityError as err:
+                assert isinstance(err.cause, CancelledError)
+                results.append("cancelled")
+            except asyncio.CancelledError:
+                results.append("cancelled")
+            results.append(await concurrent)
+            await timer
+            results.append(await start("after", 0))
+        return results
+
+
+@pytest.mark.parametrize("cancel_after_start", [False, True])
+@pytest.mark.parametrize(
+    "cancellation_type",
+    [
+        workflow.ActivityCancellationType.TRY_CANCEL,
+        workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+        workflow.ActivityCancellationType.ABANDON,
+    ],
+)
+async def test_speculative_schedule_and_cancel_in_same_activation(
+    client: Client,
+    cancellation_type: workflow.ActivityCancellationType,
+    cancel_after_start: bool,
+):
+    supported = await _optimistic_start_supported(client)
+    async with new_worker(
+        client, ScheduleAndCancelWorkflow, activities=[sleep_and_return]
+    ) as worker:
+        handle = await client.start_workflow(
+            ScheduleAndCancelWorkflow.run,
+            args=[cancellation_type, cancel_after_start],
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        assert await handle.result() == ["before", "cancelled", "concurrent", "after"]
+    events = await _history(handle)
+    # The cancelled activity's command is dropped, it never reaches the server
+    assert _activity_ids_scheduled(events) == ["1", "2", "4"]
+    summary = _summarize(events)
+    assert "ACTIVITY_TASK_CANCEL_REQUESTED" not in summary
+    if supported:
+        assert summary.count("WORKFLOW_TASK_COMPLETED") == 1
+        assert summary.count("ACTIVITY_TASK_SCHEDULED optimistic_start") == 3
+        assert summary.count("TIMER_STARTED optimistic_start") == 2
+    await _replay(handle, ScheduleAndCancelWorkflow)
+
+
+@workflow.defn
+class TimerCancelRaceWorkflow:
+    @workflow.run
+    async def run(self, gap: float) -> list[str]:
+        outcomes = []
+        async with workflow.speculative():
+            for _ in range(5):
+                # The sleep and the timeout fire together
+                try:
+                    await asyncio.wait_for(workflow.sleep(0.1), timeout=0.1 + gap)
+                    outcomes.append("slept")
+                except asyncio.TimeoutError:
+                    outcomes.append("timed out")
+                # Cancels the sleeper as its timer fires
+                sleeper = asyncio.create_task(workflow.sleep(0.1 + gap))
+                await workflow.sleep(0.1)
+                sleeper.cancel()
+                try:
+                    await sleeper
+                    outcomes.append("slept")
+                except asyncio.CancelledError:
+                    outcomes.append("cancelled")
+        return outcomes
+
+
+async def test_speculative_timer_cancel_racing_fire(
+    client: Client, env: WorkflowEnvironment
+):
+    supported = await _optimistic_start_supported(client)
+    async with new_worker(client, TimerCancelRaceWorkflow) as worker:
+        handle = await client.start_workflow(
+            TimerCancelRaceWorkflow.run,
+            # The Java test server fails a workflow task that cancels a timer
+            # which fired while the task ran, with or without speculation
+            0.5 if env.supports_time_skipping_v1 else 0,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        outcomes = await handle.result()
+    assert len(outcomes) == 10
+    assert set(outcomes[::2]) <= {"slept", "timed out"}
+    assert set(outcomes[1::2]) <= {"slept", "cancelled"}
+    events = await _history(handle)
+    # Every timer either fired or was cancelled, never both
+    ends: dict[str, list[str]] = defaultdict(list)
+    for e in events:
+        if e.event_type == EventType.EVENT_TYPE_TIMER_FIRED:
+            ends[e.timer_fired_event_attributes.timer_id].append("fired")
+        elif e.event_type == EventType.EVENT_TYPE_TIMER_CANCELED:
+            ends[e.timer_canceled_event_attributes.timer_id].append("canceled")
+    started = [
+        e.timer_started_event_attributes.timer_id
+        for e in events
+        if e.event_type == EventType.EVENT_TYPE_TIMER_STARTED
+    ]
+    assert len(started) == 20
+    assert all(len(ends[t]) == 1 for t in started), ends
+    if supported:
+        assert _summarize(events).count("WORKFLOW_TASK_COMPLETED") == 1
+    await _replay(handle, TimerCancelRaceWorkflow)
+
+
+@workflow.defn
+class CancelTaskWorkflow:
+    @workflow.run
+    async def run(
+        self, key: str, cancellation_type: workflow.ActivityCancellationType
+    ) -> list[str]:
+        async def activity_and_timer() -> None:
+            await asyncio.gather(
+                workflow.execute_activity(
+                    wait_for_cancel,
+                    key,
+                    start_to_close_timeout=timedelta(seconds=30),
+                    heartbeat_timeout=timedelta(seconds=5),
+                    cancellation_type=cancellation_type,
+                ),
+                workflow.sleep(60),
+            )
+
+        results = []
+        async with workflow.speculative():
+            task = asyncio.create_task(activity_and_timer())
+            await workflow.sleep(0.2)
+            task.cancel()
+            try:
+                await task
+                results.append("not cancelled")
+            except (asyncio.CancelledError, ActivityError):
+                results.append("cancelled")
+            results.append(
+                await workflow.execute_activity(
+                    sleep_and_return,
+                    args=["after", 0],
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
+            )
+        return results
+
+
+@pytest.mark.parametrize(
+    "cancellation_type",
+    [
+        workflow.ActivityCancellationType.TRY_CANCEL,
+        workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+    ],
+)
+async def test_speculative_activity_and_timer_cancelled_with_task(
+    client: Client, cancellation_type: workflow.ActivityCancellationType
+):
+    supported = await _optimistic_start_supported(client)
+    key = str(uuid.uuid4())
+    async with new_worker(
+        client, CancelTaskWorkflow, activities=[wait_for_cancel, sleep_and_return]
+    ) as worker:
+        handle = await client.start_workflow(
+            CancelTaskWorkflow.run,
+            args=[key, cancellation_type],
+            id=f"wf-{key}",
+            task_queue=worker.task_queue,
+        )
+        assert await handle.result() == ["cancelled", "after"]
+        await assert_eq_eventually([1], lambda: _executions_of(key))
+    summary = _summarize(await _history(handle))
+    assert "ACTIVITY_TASK_CANCEL_REQUESTED" in summary
+    assert "TIMER_CANCELED" in summary
+    if supported:
+        assert summary.count("WORKFLOW_TASK_COMPLETED") == 1
+        if (
+            cancellation_type
+            == workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+        ):
+            assert "ACTIVITY_TASK_CANCELED optimistic_resolution" in summary
+    await _replay(handle, CancelTaskWorkflow)
+
+
+@workflow.defn
+class CompleteWhileActivityRunsWorkflow:
+    @workflow.run
+    async def run(self, key: str) -> str:
+        async with workflow.speculative():
+            workflow.start_activity(
+                wait_for_cancel,
+                key,
+                start_to_close_timeout=timedelta(seconds=30),
+                heartbeat_timeout=timedelta(seconds=5),
+            )
+            await workflow.sleep(0.5)
+        return "done"
+
+
+async def test_speculative_workflow_completes_while_activity_runs(client: Client):
+    supported = await _optimistic_start_supported(client)
+    key = str(uuid.uuid4())
+    async with new_worker(
+        client, CompleteWhileActivityRunsWorkflow, activities=[wait_for_cancel]
+    ) as worker:
+        handle = await client.start_workflow(
+            CompleteWhileActivityRunsWorkflow.run,
+            key,
+            id=f"wf-{key}",
+            task_queue=worker.task_queue,
+        )
+        assert await handle.result() == "done"
+        assert _event(f"{key}-started").is_set()
+        # Nothing can observe the activity anymore, so it's cancelled
+        await assert_eq_eventually([1], lambda: _executions_of(key))
+    await _assert_history(
+        handle,
+        supported,
+        [
+            "WORKFLOW_EXECUTION_STARTED",
+            "WORKFLOW_TASK_SCHEDULED",
+            "WORKFLOW_TASK_STARTED",
+            "WORKFLOW_TASK_COMPLETED",
+            "ACTIVITY_TASK_SCHEDULED optimistic_start",
+            "TIMER_STARTED optimistic_start",
+            "TIMER_FIRED optimistic_resolution",
+            "WORKFLOW_EXECUTION_COMPLETED",
+        ],
+    )
+    await _replay(handle, CompleteWhileActivityRunsWorkflow)
+
+
+@activity.defn
+async def stop_heartbeating(key: str) -> int:
+    attempt = activity.info().attempt
+    if attempt == 1:
+        activity.heartbeat()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            _executions[key].append(attempt)
+            raise
+    return attempt
+
+
+@workflow.defn
+class TimeoutAfterHandoffWorkflow:
+    @workflow.run
+    async def run(self, key: str, timeout: str) -> int:
+        async with workflow.speculative():
+            return await workflow.execute_activity(
+                stop_heartbeating,
+                key,
+                # Both expire after the handoff at 80% of the task timeout
+                start_to_close_timeout=timedelta(
+                    seconds=30 if timeout == "heartbeat" else 3
+                ),
+                heartbeat_timeout=(
+                    timedelta(seconds=1) if timeout == "heartbeat" else None
+                ),
+                retry_policy=RetryPolicy(initial_interval=timedelta(milliseconds=50)),
+            )
+
+
+@pytest.mark.parametrize("timeout", ["heartbeat", "start_to_close"])
+async def test_speculative_handed_off_activity_times_out(client: Client, timeout: str):
+    supported = await _optimistic_start_supported(client)
+    key = str(uuid.uuid4())
+    async with new_worker(
+        client, TimeoutAfterHandoffWorkflow, activities=[stop_heartbeating]
+    ) as worker:
+        handle = await client.start_workflow(
+            TimeoutAfterHandoffWorkflow.run,
+            args=[key, timeout],
+            id=f"wf-{key}",
+            task_queue=worker.task_queue,
+            task_timeout=timedelta(seconds=2),
+        )
+        # Retried like any activity that timed out
+        assert await handle.result() == 2
+        # The timed out attempt's local execution was cancelled
+        await assert_eq_eventually([1], lambda: _executions_of(key))
+    events = await _history(handle)
+    if supported:
+        assert _optimistic_flags(events[4]) == ["optimistic_start"]
+        started = next(
+            e
+            for e in events
+            if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED
+        )
+        attrs = started.activity_task_started_event_attributes
+        assert attrs.attempt == 2
+        assert attrs.last_failure.timeout_failure_info.timeout_type == (
+            TimeoutType.TIMEOUT_TYPE_HEARTBEAT
+            if timeout == "heartbeat"
+            else TimeoutType.TIMEOUT_TYPE_START_TO_CLOSE
+        )
+    await _replay(handle, TimeoutAfterHandoffWorkflow)
+
+
+@workflow.defn
+class CancelAfterHandoffWorkflow:
+    def __init__(self) -> None:
+        self.cancel = False
+
+    @workflow.run
+    async def run(
+        self, key: str, cancellation_type: workflow.ActivityCancellationType
+    ) -> str:
+        async with workflow.speculative():
+            handle = workflow.start_activity(
+                wait_for_cancel,
+                key,
+                start_to_close_timeout=timedelta(seconds=30),
+                heartbeat_timeout=timedelta(seconds=2),
+                cancellation_type=cancellation_type,
+            )
+            await workflow.wait_condition(lambda: self.cancel)
+            handle.cancel()
+            try:
+                await handle
+                return "not cancelled"
+            except ActivityError as err:
+                assert isinstance(err.cause, CancelledError)
+                return "cancelled"
+
+    @workflow.signal
+    def request_cancel(self) -> None:
+        self.cancel = True
+
+
+@pytest.mark.parametrize(
+    "cancellation_type",
+    [
+        workflow.ActivityCancellationType.TRY_CANCEL,
+        workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+    ],
+)
+async def test_speculative_cancel_after_handoff(
+    client: Client, cancellation_type: workflow.ActivityCancellationType
+):
+    supported = await _optimistic_start_supported(client)
+    key = str(uuid.uuid4())
+    async with new_worker(
+        client, CancelAfterHandoffWorkflow, activities=[wait_for_cancel]
+    ) as worker:
+        handle = await client.start_workflow(
+            CancelAfterHandoffWorkflow.run,
+            args=[key, cancellation_type],
+            id=f"wf-{key}",
+            task_queue=worker.task_queue,
+            task_timeout=timedelta(seconds=2),
+        )
+
+        # With optimistic start, the server knows the activity once it was
+        # handed off at 80% of the task timeout
+        async def pending_activity() -> None:
+            desc = await handle.describe()
+            assert len(desc.raw_description.pending_activities) == 1
+
+        await assert_eventually(pending_activity)
+        await handle.signal(CancelAfterHandoffWorkflow.request_cancel)
+        assert await handle.result() == "cancelled"
+        # The server's cancellation reaches the local execution
+        await assert_eq_eventually([1], lambda: _executions_of(key))
+    summary = _summarize(await _history(handle))
+    if supported:
+        assert summary[4] == "ACTIVITY_TASK_SCHEDULED optimistic_start"
+        assert summary[5:8] == [
+            "WORKFLOW_EXECUTION_SIGNALED",
+            "WORKFLOW_TASK_SCHEDULED",
+            "WORKFLOW_TASK_STARTED",
+        ]
+    assert "ACTIVITY_TASK_CANCEL_REQUESTED" in summary
+    if (
+        cancellation_type
+        == workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+    ):
+        assert "ACTIVITY_TASK_CANCELED" in summary
+    await _replay(handle, CancelAfterHandoffWorkflow)
+
+
+async def test_speculative_metrics(client: Client, env: WorkflowEnvironment):
+    supported = await _optimistic_start_supported(client)
+    buffer = MetricBuffer(10000)
+    metrics_client = await env.connect_client(
+        runtime=Runtime(telemetry=TelemetryConfig(metrics=buffer))
+    )
+    async with new_worker(
+        metrics_client, ExampleWorkflow, activities=[sleep_and_return]
+    ) as worker:
+        handle = await metrics_client.start_workflow(
+            ExampleWorkflow.run,
+            # Still running at 80% of the task timeout, so it's handed off
+            2.5,
+            id=f"wf-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+            task_timeout=timedelta(seconds=2),
+        )
+        assert await handle.result() == ["a2", "a1", "a3"]
+
+    totals: defaultdict[tuple[str, str], float] = defaultdict(float)
+    for update in buffer.retrieve_updates():
+        name = update.metric.name.removeprefix("temporal_")
+        if not name.startswith(("optimistic_", "speculation_")):
+            continue
+        attrs = update.attributes
+        label = str(
+            attrs.get("checkpoint_reason")
+            or attrs.get("fallback_reason")
+            or attrs.get("outcome")
+            or ""
+        )
+        totals[(name, label)] += 1 if name.endswith("_duration") else update.value
+    if supported:
+        assert totals[("optimistic_activity_started", "")] == 3
+        assert totals[("optimistic_activity_observed", "completed")] == 2
+        assert totals[("optimistic_activity_handed_off", "")] == 1
+        assert totals[("optimistic_timer_started", "")] == 1
+        assert totals[("optimistic_timer_fired", "")] == 1
+        # a3 was still running at the deadline
+        assert totals[("speculation_window_checkpoint", "deadline")] >= 1
+        assert totals[("speculation_window_duration", "")] >= 1
+    else:
+        assert totals[("optimistic_start_fallback", "capability")] >= 1
+        assert not totals[("optimistic_activity_started", "")]
